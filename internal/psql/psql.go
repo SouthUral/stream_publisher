@@ -76,7 +76,7 @@ func (p *psql) processConn(ctx context.Context) {
 			return
 		default:
 			if !p.isConn.getIsConn() {
-				err := p.connAttempt(p.cofig.timeWaitConn, p.cofig.numAttempt, p.cofig.timeOut)
+				err := p.connAttempt(ctx, p.cofig.timeWaitConn, p.cofig.numAttempt, p.cofig.timeOut)
 				if err != nil {
 					p.Shutdown(err)
 					return
@@ -94,19 +94,24 @@ func (p *psql) processConn(ctx context.Context) {
 //   - timeWait - время ожидания между попытками подключения (в секундах);
 //   - numAttempt - количество попыток;
 //   - timeOut - время ожидания коннекта (в секундах)
-func (p *psql) connAttempt(timeWait, numAttempt, timeOut int) error {
+func (p *psql) connAttempt(ctx context.Context, timeWait, numAttempt, timeOut int) error {
 	var err, errConn error
 	for i := 0; i < numAttempt; i++ {
-		if !p.isConn.isConnect {
-			errConn = p.connPg(timeOut)
-			if errConn != nil {
-				log.Error(errConn)
-			}
-		} else {
+		select {
+		case <-ctx.Done():
 			return err
+		default:
+			p.checkConn()
+			if !p.isConn.isConnect {
+				errConn = p.connPg(timeOut)
+				if errConn != nil {
+					log.Error(errConn)
+				}
+			} else {
+				return err
+			}
+			time.Sleep(time.Duration(timeWait) * time.Second)
 		}
-		time.Sleep(time.Duration(timeWait) * time.Second)
-		p.checkConn()
 	}
 
 	err = fmt.Errorf("%w: %w", reconnectionAttemptsEndedError{}, errConn)
