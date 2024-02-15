@@ -1,5 +1,8 @@
 package psql
 
 type incomigMessage interface {
-	getTypeMessage() string
+	GetTypeMessage() string
+	GetParamFirst() int
+	GetParamSecond() int
+	GetCh() chan interface{}
 }

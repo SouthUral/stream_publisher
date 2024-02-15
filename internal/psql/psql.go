@@ -6,15 +6,15 @@ import (
 	"sync"
 	"time"
 
-	pgx "github.com/jackc/pgx/v5"
 	log "github.com/sirupsen/logrus"
 )
 
 // функция инициализирует подключение к PostgreSQL
-func initPsql(url string, timeWaitConn, timeWaitCheck, numAttempt, timeOut int) *psql {
+func InitPsql(url string, externalCh chan interface{}, timeWaitConn, timeWaitCheck, numAttempt, timeOut int) *psql {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	conf := configPsql{
+	conf := configPg{
+		url:           url,
 		timeWaitConn:  timeWaitConn,
 		timeWaitCheck: timeWaitCheck,
 		numAttempt:    numAttempt,
@@ -22,24 +22,20 @@ func initPsql(url string, timeWaitConn, timeWaitCheck, numAttempt, timeOut int) 
 	}
 
 	pq := &psql{
-		url:    url,
-		cancel: cancel,
-		isConn: initConnFlag(),
-		cofig:  conf,
+		cancel:     cancel,
+		conn:       initPgConn(conf),
+		incomingCh: externalCh,
 	}
 
-	go pq.processConn(ctx)
+	go pq.processReceivingEvents(ctx)
 
 	return pq
 }
 
 type psql struct {
-	url        string
 	cancel     func()
-	conn       *pgx.Conn
+	conn       *pgConn
 	mx         sync.RWMutex
-	isConn     *connectionFlag // флаг, показывающий есть ли коннект
-	cofig      configPsql
 	incomingCh chan interface{}
 }
 
@@ -54,98 +50,143 @@ func (p *psql) processReceivingEvents(ctx context.Context) {
 		case msg := <-p.incomingCh:
 			message, ok := msg.(incomigMessage)
 			if !ok {
-				p.Shutdown(messageConversionError{})
+				p.Shutdown(messageConversionError{"psql"})
 				return
 			}
-			p.chooseAction(message)
+			p.chooseAction(ctx, message)
 		}
 	}
 }
 
-func (p *psql) chooseAction(message incomigMessage) {
-
+// метод выбирает действия исходя из типа сообщения и запускает его
+func (p *psql) chooseAction(ctx context.Context, message incomigMessage) {
+	typeMsg := message.GetTypeMessage()
+	switch typeMsg {
+	case GetBatchMessages:
+		go p.getBatchEvents(ctx, message)
+	case GetLastOffset:
+		go p.getLastOffset(ctx, message, 20, 2)
+	case UpdateLastOffset:
+		go p.updateLastOffset(ctx, message)
+	case CleanLastOffset:
+		go p.cleanLastOffset(ctx, message)
+	default:
+		log.Warning(unknownTypeMessageError{typeMsg})
+	}
 }
 
-// процесс контролирующий подключение к PostgreSQL
-func (p *psql) processConn(ctx context.Context) {
-	defer log.Warning("processConn has finished executing")
+// процесс получения и отправки данных
+func (p *psql) getBatchEvents(ctx context.Context, msg incomigMessage) {
+	var p1, p2 int // временные параметры
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			if !p.isConn.getIsConn() {
-				err := p.connAttempt(ctx, p.cofig.timeWaitConn, p.cofig.numAttempt, p.cofig.timeOut)
-				if err != nil {
-					p.Shutdown(err)
-					return
-				}
+	ch := msg.GetCh()
 
-			}
+	p1 = msg.GetParamFirst()
+	p2 = msg.GetParamSecond()
 
-			time.Sleep(time.Duration(p.cofig.timeWaitCheck) * time.Second)
+	rows, err := p.conn.RequestRowsEvents(ctx, gettingBundleOfEvents, p1, p2)
+
+	if err != nil {
+		log.Error(err)
+		ch <- AnswerData{
+			err: err,
+		}
+		return
+	}
+
+	numRows := len(rows)
+	// отправка ответа
+	for num, eventData := range rows {
+		rowsLeft := numRows - num + 1
+		ch <- AnswerData{
+			rowsLeft: rowsLeft,
+			data:     eventData,
 		}
 	}
 
+	defer close(ch)
 }
 
-// метод производит заданное количество попыток подключения, через заданный интервал:
-//   - timeWait - время ожидания между попытками подключения (в секундах);
-//   - numAttempt - количество попыток;
-//   - timeOut - время ожидания коннекта (в секундах)
-func (p *psql) connAttempt(ctx context.Context, timeWait, numAttempt, timeOut int) error {
-	var err, errConn error
-	for i := 0; i < numAttempt; i++ {
-		select {
-		case <-ctx.Done():
-			return err
-		default:
-			p.checkConn()
-			if !p.isConn.isConnect {
-				errConn = p.connPg(timeOut)
-				if errConn != nil {
-					log.Error(errConn)
-				}
+func (p *psql) getLastOffset(ctx context.Context, msg incomigMessage, numAttempt, timeWait int) {
+	ch := msg.GetCh()
+
+	offset, err := func() (int, error) {
+		var offset int
+		var err error
+		for i := 0; i < numAttempt; i++ {
+			offset, err = p.conn.RequestRowInt(ctx, getLastOffset)
+			if err != nil {
+				log.Warningf("retry the request %s", getLastOffset)
 			} else {
-				return err
+				return offset, err
 			}
 			time.Sleep(time.Duration(timeWait) * time.Second)
 		}
-	}
+		err = fmt.Errorf("%w: %w", requestAttemptsEndedError{}, err)
+		return offset, err
+	}()
 
-	err = fmt.Errorf("%w: %w", reconnectionAttemptsEndedError{}, errConn)
-	return err
-}
-
-// метод подключения к PostgreSQL
-//   - timeOut - время ожидания коннекта (в секундах)
-func (p *psql) connPg(timeOut int) error {
-	var err error
-	ctx, _ := context.WithTimeout(context.Background(), time.Duration(timeOut)*time.Second)
-
-	p.conn, err = pgx.Connect(ctx, p.url)
 	if err != nil {
-		log.Error(err)
-		p.isConn.setIsConn(false)
-	} else {
-		p.isConn.setIsConn(true)
+		ch <- AnswerData{
+			err: err,
+		}
+		return
 	}
 
-	return err
+	ch <- AnswerData{
+		data: EventData{
+			Offset: offset,
+		},
+	}
+
+	defer close(ch)
 }
 
-func (p *psql) checkConn() {
-	if p.conn.IsClosed() {
-		p.isConn.setIsConn(false)
+func (p *psql) updateLastOffset(ctx context.Context, msg incomigMessage) {
+
+	ch := msg.GetCh()
+
+	p1 := msg.GetParamFirst()
+
+	err := p.conn.UpdateOffset(ctx, updateOffset, p1)
+	if err != nil {
+		ch <- AnswerData{
+			err: err,
+		}
+		return
 	}
+
+	ch <- AnswerData{}
+	defer close(ch)
 }
+
+func (p *psql) cleanLastOffset(ctx context.Context, msg incomigMessage) {
+
+	ch := msg.GetCh()
+
+	err := p.conn.UpdateOffset(ctx, updateOffset, 0)
+	if err != nil {
+		ch <- AnswerData{
+			err: err,
+		}
+		return
+	}
+
+	ch <- AnswerData{}
+	defer close(ch)
+}
+
+// func (p *psql) makeRequest(someFunc func(context.Context, incomigMessage) error, numAttempt int) {
+// 	err := f()
+
+// }
 
 // метод для прекращения работы psql
 //   - err - ошибка, по причине которой была прекращена работа
 func (p *psql) Shutdown(err error) {
 	err = fmt.Errorf("%w: %w", terminationPsqlError{}, err)
 	log.Warning(err)
+	p.conn.Shutdown(err)
 
 	p.cancel()
 }

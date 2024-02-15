@@ -1,4 +1,4 @@
-module main
+module streamPublisher
 
 go 1.21.6
 

@@ -30,7 +30,8 @@ func (c *connectionFlag) getIsConn() bool {
 	return res
 }
 
-type configPsql struct {
+type configPg struct {
+	url           string
 	timeWaitConn  int // время ожидания при переподключении
 	timeWaitCheck int // время ожидания между проверками коннекта
 	numAttempt    int // количество попыток подключения (за один раз)
