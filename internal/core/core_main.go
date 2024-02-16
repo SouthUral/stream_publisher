@@ -55,6 +55,7 @@ func (c *Core) coreProcess(ctx context.Context) {
 			err := c.workWithBatch(ctx)
 			if err != nil {
 				log.Error(err)
+				c.Shutdown(err)
 				return
 			}
 		}
@@ -73,6 +74,8 @@ func (c *Core) workWithBatch(ctx context.Context) error {
 
 	defer log.Warning("core.workWithBatch has finished work")
 
+	log.Info("receiving a batch of messages")
+
 	// формирование запроса
 	msg := transportMsg{
 		typeMsg:   GetBatchMessages,
@@ -90,6 +93,11 @@ func (c *Core) workWithBatch(ctx context.Context) error {
 			// прекращение работы
 			return err
 		case answ, chOk := <-msg.reverseСh:
+			// прекращение работы, когда закрывается канал
+			if !chOk {
+				return err
+			}
+
 			answer, ok := answ.(AnswerStorage)
 			if !ok {
 				err = messageConversionError{"core.workWithBatch"}
@@ -110,9 +118,8 @@ func (c *Core) workWithBatch(ctx context.Context) error {
 				return err
 			}
 
-			// прекращение работы, когда закрывается канал
-			if !chOk {
-				c.lastOffset = answer.GetOffset()
+			err = c.saveOffset(10, offset)
+			if err != nil {
 				return err
 			}
 
@@ -139,6 +146,43 @@ func (c *Core) sendMessageToStream(ctx context.Context, message []byte, timeWait
 		}
 	}
 	err = failedToSendMessageError{}
+	return err
+}
+
+func (c *Core) saveOffset(timeOut, offset int) error {
+	var err error
+
+	ctx, _ := context.WithTimeout(context.Background(), time.Duration(timeOut)*time.Second)
+
+	msg := transportMsg{
+		typeMsg:   UpdateLastOffset,
+		reverseСh: make(chan interface{}),
+		param1:    offset,
+	}
+
+	c.storageCh <- msg
+
+	select {
+	case <-ctx.Done():
+		err = fmt.Errorf("%w: %w", timeOutError{}, noResponseStorageError{})
+		log.Error(err)
+		return err
+	case answ := <-msg.GetCh():
+		answer, ok := answ.(AnswerStorage)
+		if !ok {
+			err = messageConversionError{"core.saveOffset"}
+			log.Error(err)
+			return err
+		}
+
+		err = answer.GetError()
+		if err != nil {
+			err = fmt.Errorf("%w: %w", storageError{}, err)
+			log.Error(err)
+			return err
+		}
+	}
+
 	return err
 }
 
