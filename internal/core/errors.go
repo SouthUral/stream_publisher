@@ -10,6 +10,13 @@ func (e messageConversionError) Error() string {
 	return fmt.Sprintf("message conversion error: %s", e.place)
 }
 
+type failedToSendMessageError struct {
+}
+
+func (e failedToSendMessageError) Error() string {
+	return "failed to send message to stream"
+}
+
 type storageError struct {
 }
 

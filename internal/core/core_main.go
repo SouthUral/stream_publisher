@@ -8,35 +8,37 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func InitCore(limitBatch int) *Core {
+func InitCore(limitBatch int, storageCh, streamCh chan interface{}) *Core {
 	res := &Core{
-		storageCh:  make(chan interface{}),
+		storageCh:  storageCh,
+		streamCh:   streamCh,
 		limitBatch: limitBatch,
 	}
 
 	return res
 }
 
-func (c *Core) GetStorageCh() chan interface{} {
-	return c.storageCh
-}
-
 type Core struct {
 	storageCh  chan interface{}
+	streamCh   chan interface{}
 	lastOffset int
 	limitBatch int
 	cancel     func()
 }
 
-func (c *Core) StartProcess() {
+func (c *Core) StartProcess() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c.cancel = cancel
 
 	go c.coreProcess(ctx)
+
+	return ctx
 }
 
 func (c *Core) coreProcess(ctx context.Context) {
+	defer log.Warning("coreProcess has finished")
+
 	offset, err := c.getLastOffset(10)
 
 	if err != nil {
@@ -46,10 +48,15 @@ func (c *Core) coreProcess(ctx context.Context) {
 	c.lastOffset = offset
 
 	for {
-		err := c.workWithBatch(ctx)
-		if err != nil {
-			log.Error(err)
+		select {
+		case <-ctx.Done():
 			return
+		default:
+			err := c.workWithBatch(ctx)
+			if err != nil {
+				log.Error(err)
+				return
+			}
 		}
 	}
 }
@@ -63,6 +70,8 @@ func (c *Core) workWithBatch(ctx context.Context) error {
 			c.lastOffset = offset
 		}
 	}()
+
+	defer log.Warning("core.workWithBatch has finished work")
 
 	// формирование запроса
 	msg := transportMsg{
@@ -96,6 +105,10 @@ func (c *Core) workWithBatch(ctx context.Context) error {
 			offset = answer.GetOffset()
 
 			log.Infof("got offset: %d", offset)
+			err = c.sendMessageToStream(ctx, answer.GetMessage(), 3, 15)
+			if err != nil {
+				return err
+			}
 
 			// прекращение работы, когда закрывается канал
 			if !chOk {
@@ -106,6 +119,27 @@ func (c *Core) workWithBatch(ctx context.Context) error {
 			time.Sleep(1 * time.Second)
 		}
 	}
+}
+
+func (c *Core) sendMessageToStream(ctx context.Context, message []byte, timeWait, numAttempt int) error {
+	var err error
+
+	msgToSend := initMessageToStream(message)
+
+	for i := 0; i < numAttempt; i++ {
+		c.streamCh <- *msgToSend
+
+		select {
+		case <-ctx.Done():
+			return err
+		case <-msgToSend.GetSuccsessfull():
+			return err
+		case <-msgToSend.GetUnSuccsessfull():
+			time.Sleep(time.Duration(timeWait) * time.Second)
+		}
+	}
+	err = failedToSendMessageError{}
+	return err
 }
 
 func (c *Core) getLastOffset(timeOut int) (int, error) {
@@ -152,9 +186,3 @@ func (c *Core) Shutdown(err error) {
 	c.cancel()
 	log.Warning(err)
 }
-
-// метод для отправки сообщения
-// func (c *Core) sendTransportMsg(msg transportMsg) error {
-// 	c.storageCh <- msg
-
-// }

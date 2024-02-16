@@ -10,7 +10,7 @@ import (
 )
 
 // функция инициализирует подключение к PostgreSQL
-func InitPsql(url string, externalCh chan interface{}, timeWaitConn, timeWaitCheck, numAttempt, timeOut int) *psql {
+func InitPsql(url string, timeWaitConn, timeWaitCheck, numAttempt, timeOut int) *psql {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	conf := configPg{
@@ -24,7 +24,7 @@ func InitPsql(url string, externalCh chan interface{}, timeWaitConn, timeWaitChe
 	pq := &psql{
 		cancel:     cancel,
 		conn:       initPgConn(conf),
-		incomingCh: externalCh,
+		incomingCh: make(chan interface{}),
 	}
 
 	go pq.processReceivingEvents(ctx)
@@ -37,6 +37,10 @@ type psql struct {
 	conn       *pgConn
 	mx         sync.RWMutex
 	incomingCh chan interface{}
+}
+
+func (p *psql) GetCh() chan interface{} {
+	return p.incomingCh
 }
 
 // процесс для получения события и ответа на них
